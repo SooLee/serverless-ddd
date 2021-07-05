@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: DenialList stack for a serverless architecture for frequency-based HTTP request filtering against distributed denial-of-service (DDoS) attacks
+
+
+Parameters:
+  DenialListTableName:
+    Type: String
+    Default: ServerlessDDD_Denial_List
+
+Resources:
+  DenialListTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DenialListTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: key
+          KeyType: HASH

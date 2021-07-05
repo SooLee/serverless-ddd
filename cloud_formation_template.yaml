@@ -1,0 +1,562 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: A serverless architecture for frequency-based HTTP request filtering against distributed denial-of-service (DDoS) attacks
+
+
+Parameters:
+
+  # The following parameters must be changed according to the bucket name and admin's email.
+  LambdaCodeBucket:
+    Type: String
+    Default: serverless-ddd-lambda-code  # replace with your bucket name
+  EmailAddress:
+    Type: String
+    Default: duplexa@gmail.com  # replace with your email address
+
+  InvocationThreshold:
+    Type: Number
+    Default: 10  # replace if you want to change the Connection Lambda invocation threshold (per minute)
+  DenialThreshold:
+    Type: Number
+    Default: 12  # replace if you want to change the frequency threshold (per minute) for a requester to be listed on Denial list
+  
+  MainName:
+    Type: String
+    Default: ServerlessDDD
+  ConnectionLambdaName:
+    Type: String
+    Default: ServerlessDDD_ConnectionLambda
+  FilterLambdaName:
+    Type: String
+    Default: ServerlessDDD_FilterLambda
+  AlarmLambdaName:
+    Type: String
+    Default: ServerlessDDD_AlarmLambda
+  CloudwatchAlarmName:
+    Type: String
+    Default: ServerlessDDD_Alarm
+  SNSTopicName:
+    Type: String
+    Default: ServerlessDDD_SNSTopic
+  CloudwatchAlarmEventRuleName:
+    Type: String
+    Default: ServerlessDDD
+  RawTableName:
+    Type: String
+    Default: ServerlessDDD_Raw_Table
+
+  # Denial List table is generated through a separate track.
+  # The name must be matched with the one used in the other template.
+  DenialListTableName:
+    Type: String
+    Default: ServerlessDDD_Denial_List
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Ref MainName
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.48/28
+      AvailabilityZone: us-east-1a
+      Tags:
+        - Key: Name
+          Value: !Ref MainName 
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Ref MainName
+
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Enable SSH and HTTP inbound
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 10.0.0.0/24
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/24
+
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0742b4e673072066f
+      KeyName: soo-10k-duplexa
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref InstanceSecurityGroup
+          DeviceIndex: 0
+          DeleteOnTermination: true
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PrivateSubnet
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - "\n"
+            -
+              - "#!/bin/bash"
+              - "yum update -y"
+              - "yum install -y httpd"
+              - "systemctl start httpd"
+              - "cd /var/www/html"
+              - "cat >>index.html <<EOF"
+              - "<html><head>Serverless-DDD</head><body><h1>Serverless-DDD Test Webpage (PAGE1) from EC2 web server</h1><br><a href='page2.html'><h2>page-2</h2></a></body></html>"
+              - "EOF"
+              - "cat >>page2.html <<EOF"
+              - "<html><head>Serverless-DDD</head><body><h1>Serverless-DDD Test Webpage (PAGE2) from EC2 web server</h1><br><a href='index.html'><h2>page-1</h2></a></body></html>"
+              - "EOF"
+              - "chmod +rx index.html page2.html"
+      Tags:
+        - Key: Name
+          Value: !Ref MainName
+      Monitoring: true
+
+  VPCEndpointForDynamoDB:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: "*"
+            Effect: Allow
+            Resource: "*"
+            Principal: "*"
+      RouteTableIds: 
+        - !Ref PrivateRouteTable
+      ServiceName: !Sub
+        - 'com.amazonaws.${Region}.dynamodb'
+        - Region: !Ref "AWS::Region"
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+
+  VPCEndpointForS3:
+  # to allow yup updates and install to use AWS repository
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "s3:Get*"
+              - "s3:List*"
+            Effect: Allow
+            Resource:
+              - "*"
+            Principal: "*"
+      RouteTableIds: 
+        - !Ref PrivateRouteTable
+      ServiceName: !Sub
+        - 'com.amazonaws.${Region}.s3'
+        - Region: !Ref "AWS::Region"
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+
+  ConnectionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.6
+      FunctionName: !Ref ConnectionLambdaName
+      Description: Lambda connecting to Web Server instance
+      Handler: app.app
+      Role: !GetAtt ConnectionLambdaIAMRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Code:
+        S3Bucket: !Sub '${LambdaCodeBucket}'
+        S3Key: connection_lambda.zip
+      Environment:
+        Variables:
+          SERVER_PRIVATE_IP: !GetAtt WebServerInstance.PrivateIp
+          RAW_TABLE: !Ref RawTableName
+    DependsOn:
+      - WebServerInstance
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: SecurityGroup for ConnectionLambda
+
+  ConnectionLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ConnectionLambdaName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: dynamoDB_put_item
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:*:table/${RawTableName}'
+        - PolicyName: lambda_access_to_vpc
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeInstances
+                  - ec2:AttachNetworkInterface
+                Resource:
+                  - '*'
+
+  ConnectionLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ConnectionLambdaName}
+
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref MainName
+
+  APIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref APIGateway
+      StageName: api
+    DependsOn:
+      - APIGatewayMethod
+
+  APIGatewayProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: "{proxy+}"
+      RestApiId: !Ref APIGateway
+
+  APIGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaARN}/invocations
+          - LambdaARN: !GetAtt FilterLambda.Arn
+            Region: !Ref "AWS::Region"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            text/html: Empty
+      RestApiId: !Ref APIGateway
+      ResourceId: !GetAtt APIGateway.RootResourceId
+
+  APIGatewayProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaARN}/invocations
+          - LambdaARN: !GetAtt FilterLambda.Arn
+            AccID: !Ref "AWS::AccountId"
+            Region: !Ref "AWS::Region"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            text/html: Empty
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref APIGatewayProxyResource
+
+  APIGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt FilterLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+        - arn:aws:execute-api:${Region}:${AccID}:${APIGatewayID}/*
+        - APIGatewayID: !Ref APIGateway
+          AccID: !Ref "AWS::AccountId"
+          Region: !Ref "AWS::Region"
+
+  FilterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.6
+      FunctionName: !Ref FilterLambdaName
+      Description: Lambda filtering source IP / user-agent using Denial List
+      Handler: app.lambda_handler
+      Role: !GetAtt FilterLambdaIAMRole.Arn
+      Code:
+        S3Bucket: !Sub '${LambdaCodeBucket}'
+        S3Key: filter_lambda.zip
+      Environment:
+        Variables:
+          CONNECTION_LAMBDA_NAME: !Ref ConnectionLambdaName
+          BLACKLIST_TABLE_NAME: !Ref DenialListTableName
+
+  FilterLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref FilterLambdaName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: lambda_invocation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub
+                      - 'arn:aws:lambda:${Region}:${AccID}:function:${ConnectionLambdaName}'
+                      - AccID: !Ref "AWS::AccountId"
+                        Region: !Ref "AWS::Region"
+        - PolicyName: dynamoDB_query_deniallist
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:*:table/${DenialListTableName}'
+
+  FilterLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${FilterLambdaName}'
+
+  AlarmLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.6
+      FunctionName: !Ref AlarmLambdaName
+      Description: Lambda responding to the Cloudwatch alarm
+      Handler: app.lambda_handler
+      Role: !GetAtt AlarmLambdaIAMRole.Arn
+      Code:
+        S3Bucket: !Sub '${LambdaCodeBucket}'
+        S3Key: alarm_lambda.zip
+      Environment:
+        Variables:
+          BLACKLIST_TABLE_NAME: !Ref DenialListTableName
+          RAW_TABLE_NAME: !Ref RawTableName
+          CLOUDWATCH_ALARM_NAME: !Ref CloudwatchAlarmName 
+          DENIAL_LIST_THRESHOLD: !Ref DenialThreshold
+
+  AlarmLambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AlarmLambdaName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: dynamoDB_put_item_to_deniallist_table
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:*:table/${DenialListTableName}'
+        - PolicyName: dynamoDB_read_raw_table
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:*:*:table/${RawTableName}'
+
+  AlarmLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AlarmLambdaName}'
+
+  CloudwatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Ref CloudwatchAlarmName
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ConnectionLambdaName
+      MetricName: Invocations
+      Period: 60
+      Threshold: !Ref InvocationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Statistic: Sum
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      AlarmActions: 
+        - !Sub
+            - 'arn:aws:sns:${Region}:${AccID}:${SNSTopicName}'
+            - AccID: !Ref "AWS::AccountId"
+              Region: !Ref "AWS::Region"
+    DependsOn:
+      - SNSSubscription
+      - ConnectionLambda
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Ref SNSTopicName
+      DisplayName: !Ref SNSTopicName
+
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref EmailAddress
+      TopicArn: !Ref SNSTopic
+
+  CloudwatchAlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref CloudwatchAlarmEventRuleName
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        resources:
+          - !Sub
+              - 'arn:aws:cloudwatch:${Region}:${AccID}:alarm:${CloudwatchAlarmName}'
+              - AccID: !Ref "AWS::AccountId"
+                Region: !Ref "AWS::Region"
+      State: ENABLED
+      Targets:
+        - Arn: !Sub
+            - 'arn:aws:lambda:${Region}:${AccID}:function:${AlarmLambdaName}'
+            - AccID: !Ref "AWS::AccountId"
+              Region: !Ref "AWS::Region"
+          Id: InvokeAlarmLambda
+      RoleArn: !Sub
+        - 'arn:aws:iam::${AccID}:role/${CloudwatchAlarmEventRuleName}'
+        - AccID: !Ref "AWS::AccountId"
+    DependsOn:
+      - CloudwatchAlarm
+      - AlarmLambda
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref AlarmLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: 
+        Fn::GetAtt: 
+          - CloudwatchAlarmEventRule
+          - Arn
+
+  CloudwatchAlarmEventRuleIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CloudwatchAlarmEventRuleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+      Policies:
+        - PolicyName: alarm_lambda_invocation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub
+                      - 'arn:aws:lambda:${Region}:${AccID}:function:${AlarmLambdaName}'
+                      - AccID: !Ref "AWS::AccountId"
+                        Region: !Ref "AWS::Region"
+    DependsOn:
+      - AlarmLambda
+
+  RawTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref RawTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: uuid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: uuid
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expdate
+        Enabled: true
+
+
+Outputs:
+  APIGateway:
+    Description: APIGateway
+    Value: !Sub
+        - 'https://${APIGateway}.execute-api.${Region}.amazonaws.com/api'
+        - Region: !Ref "AWS::Region"
