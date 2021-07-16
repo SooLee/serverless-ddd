@@ -2,6 +2,8 @@
 
 This repository contains Lambda code and CloudFormation templates for a minimal, proof-of-concept serverless DDoS Detection and Prevention system.
 
+Detail in https://www.techrxiv.org/articles/preprint/A_serverless_architecture_for_frequency-based_HTTP_request_filtering_against_distributed_denial-of-service_DDoS_attacks/14912778
+
 
 Note: The template and code have been tested only in us-east-1.
 
